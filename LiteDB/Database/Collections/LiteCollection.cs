@@ -1,5 +1,9 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Reflection;
 
 namespace LiteDB
 {
@@ -30,6 +34,11 @@ namespace LiteDB
             _log = log;
             _visitor = new QueryVisitor<T>(mapper);
             _includes = new List<Action<BsonDocument>>();
+        }
+
+        public IQueryable<T> AsQueryable()
+        {
+            return new LiteCollectionAsQueryable<T>(new LiteDbCollectionQueryProvider<T>(this, _mapper));
         }
     }
 }

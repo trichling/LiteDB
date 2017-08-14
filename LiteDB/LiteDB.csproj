@@ -37,4 +37,10 @@
     <Reference Include="System" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="Collections\**" />
+    <EmbeddedResource Remove="Collections\**" />
+    <None Remove="Collections\**" />
+  </ItemGroup>
+
 </Project>
