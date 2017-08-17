@@ -1,4 +1,5 @@
-﻿using System;
+﻿
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -8,14 +9,12 @@ using ParameterDictionary = System.Collections.Generic.Dictionary<System.Linq.Ex
 
 namespace LiteDB
 {
-    /// <summary>
-    /// Class helper to create Queries based on Linq expressions
-    /// </summary>
     internal class QueryVisitor<T>
     {
-        private BsonMapper _mapper;
-        private Type _type;
+        private readonly BsonMapper _mapper;
+        private readonly Type _type;
         private ParameterDictionary _parameters = new ParameterDictionary();
+        private Stack<string> _fieldPrefixes = new Stack<string>();
 
         public QueryVisitor(BsonMapper mapper)
         {
@@ -23,161 +22,309 @@ namespace LiteDB
             _type = typeof(T);
         }
 
-        public Query Visit(Expression<Func<T, bool>> predicate)
-        {
-            var lambda = predicate as LambdaExpression;
 
-            return VisitExpression(lambda.Body);
+        public Query Visit(Expression expression)
+        {
+            if (expression.NodeType == ExpressionType.Quote)
+                expression = StripQuotes(expression);
+
+            var @switch = new Dictionary<Type, Func<Expression, Query>>
+            {
+                { typeof(MethodCallExpression), expr => Visit(expr as MethodCallExpression) },
+                { typeof(ConstantExpression), expr => Visit(expr as ConstantExpression) },
+                { typeof(LambdaExpression), expr => Visit(expr as LambdaExpression) },
+                { typeof(MemberExpression), expr => Visit(expr as MemberExpression) },
+                { typeof(BinaryExpression), expr => Visit(expr as BinaryExpression) },
+                { typeof(UnaryExpression), expr => Visit(expr as UnaryExpression) },
+                { typeof(InvocationExpression), expr => Visit(expr as InvocationExpression) },
+            };
+
+            var key = @switch.Keys.SingleOrDefault(t => t.IsAssignableFrom(expression.GetType()));
+
+            if (key != null)
+                return @switch[key](expression);
+
+            throw new Exception();
         }
 
-        private Query VisitExpression(Expression expr, string prefix = null)
+        public Expression StripQuotes(Expression e)
         {
-            // Single: x.Active
-            if (expr is MemberExpression && expr.Type == typeof(bool))
+            while (e.NodeType == ExpressionType.Quote)
             {
-                return Query.EQ(this.GetField(expr, prefix), new BsonValue(true));
+                e = ((UnaryExpression)e).Operand;
             }
-            // Not: !x.Active or !(x.Id == 1)
-            else if (expr.NodeType == ExpressionType.Not)
-            {
-                var unary = expr as UnaryExpression;
-                return Query.Not(this.VisitExpression(unary.Operand, prefix));
-            }
-            // Equals: x.Id == 1
-            else if (expr.NodeType == ExpressionType.Equal)
-            {
-                var bin = expr as BinaryExpression;
-                return new QueryEquals(this.GetField(bin.Left, prefix), this.VisitValue(bin.Right, bin.Left));
-            }
-            // NotEquals: x.Id != 1
-            else if (expr.NodeType == ExpressionType.NotEqual)
-            {
-                var bin = expr as BinaryExpression;
-                return Query.Not(this.GetField(bin.Left, prefix), this.VisitValue(bin.Right, bin.Left));
-            }
-            // LessThan: x.Id < 5
-            else if (expr.NodeType == ExpressionType.LessThan)
-            {
-                var bin = expr as BinaryExpression;
-                return Query.LT(this.GetField(bin.Left, prefix), this.VisitValue(bin.Right, bin.Left));
-            }
-            // LessThanOrEqual: x.Id <= 5
-            else if (expr.NodeType == ExpressionType.LessThanOrEqual)
-            {
-                var bin = expr as BinaryExpression;
-                return Query.LTE(this.GetField(bin.Left, prefix), this.VisitValue(bin.Right, bin.Left));
-            }
-            // GreaterThan: x.Id > 5
-            else if (expr.NodeType == ExpressionType.GreaterThan)
-            {
-                var bin = expr as BinaryExpression;
-                return Query.GT(this.GetField(bin.Left, prefix), this.VisitValue(bin.Right, bin.Left));
-            }
-            // GreaterThanOrEqual: x.Id >= 5
-            else if (expr.NodeType == ExpressionType.GreaterThanOrEqual)
-            {
-                var bin = expr as BinaryExpression;
-                return Query.GTE(this.GetField(bin.Left, prefix), this.VisitValue(bin.Right, bin.Left));
-            }
-            // And: x.Id > 1 && x.Name == "John"
-            else if (expr.NodeType == ExpressionType.AndAlso)
-            {
-                var bin = expr as BinaryExpression;
-                var left = this.VisitExpression(bin.Left, prefix);
-                var right = this.VisitExpression(bin.Right, prefix);
 
-                return Query.And(left, right);
-            }
-            // Or: x.Id == 1 || x.Name == "John"
-            else if (expr.NodeType == ExpressionType.OrElse)
-            {
-                var bin = expr as BinaryExpression;
-                var left = this.VisitExpression(bin.Left);
-                var right = this.VisitExpression(bin.Right);
+            return e;
+        }
 
-                return Query.Or(left, right);
-            }
-            // Constant: do nothing (at this point it's useful only to PredicateBuilder)
-            else if (expr.NodeType == ExpressionType.Constant)
-            {
-                var constant = expr as ConstantExpression;
+        public Query Visit(MethodCallExpression expr)
+        {
 
-                if (constant.Value is bool)
-                {
-                    var value = (bool)constant.Value;
-
-                    return value ? Query.All() : new QueryEmpty();
-                }
-            }
-            // Invoke: call inner Lambda expression (used in PredicateBuilder)
-            else if (expr.NodeType == ExpressionType.Invoke)
-            {
-                var invocation = expr as InvocationExpression;
-                var lambda = invocation.Expression as LambdaExpression;
-                return this.VisitExpression(lambda.Body);
-            }
-            // MethodCall: x.Name.StartsWith("John")
-            else if (expr is MethodCallExpression)
-            {
-                var met = expr as MethodCallExpression;
-                var method = met.Method.Name;
+            var method = expr.Method.Name;
 #if NET35
-                var type = met.Method.ReflectedType;
+            var type = expr.Method.ReflectedType;
 #else
-                var type = met.Method.DeclaringType;
+            var type = expr.Method.DeclaringType;
 #endif
-                var paramType = met.Arguments[0] is MemberExpression ? 
-                    (ExpressionType?)(met.Arguments[0] as MemberExpression).Expression.NodeType :
+
+            switch (method)
+            {
+                case "Where":
+                    return WhereMethodCallExpression(expr);
+
+                case "StartsWith":
+                    return StartsWithMethodCallExpression(expr);
+
+                case "Equals":
+                    return EqualsMethodCallExpression(expr);
+
+                case "Contains":
+                    return ContainsMethodCallExpression(expr);
+
+                case "Any":
+                    return AnyMethodCallExpression(expr);
+
+                default:
+                    return EnumerableMethodCallExpression(expr);
+            }
+
+            throw new Exception();
+        }
+
+        private Query WhereMethodCallExpression(MethodCallExpression expr)
+        {
+            var left = Visit(expr.Arguments[0]);
+            var right = Visit(expr.Arguments[1]);
+            return Query.And(left, right);
+        }
+
+        private Query StartsWithMethodCallExpression(MethodCallExpression expr)
+        {
+            var value = this.GetValue(expr.Arguments[0]);
+            return Query.StartsWith(this.GetField(expr.Object), value);
+        }
+
+        private Query EqualsMethodCallExpression(MethodCallExpression expr)
+        {
+            var value = this.GetValue(expr.Arguments[0]);
+            return Query.EQ(this.GetField(expr.Object), value);
+        }
+
+        private Query ContainsMethodCallExpression(MethodCallExpression expr)
+        {
+#if NET35
+            var type = expr.Method.ReflectedType;
+#else
+            var type = expr.Method.DeclaringType;
+#endif
+            if (type == typeof(string))
+            {
+                var field = this.GetField(expr.Object);
+                var value = this.GetValue(expr.Arguments[0]);
+
+                return Query.Contains(field, value);
+            }
+
+            // Contains (Enumerable): x.ListNumber.Contains(2)
+            if (type == typeof(Enumerable))
+            {
+                var field = this.GetField(expr.Arguments[0]);
+                var value = this.GetValue(expr.Arguments[1]);
+
+                return Query.EQ(field, value);
+            }
+
+            throw new Exception();
+        }
+
+        private Query AnyMethodCallExpression(MethodCallExpression expr)
+        {
+#if NET35
+            var type = expr.Method.ReflectedType;
+#else
+            var type = expr.Method.DeclaringType;
+#endif
+
+            var paramType = expr.Arguments[0] is MemberExpression ?
+                    (ExpressionType?)(expr.Arguments[0] as MemberExpression).Expression.NodeType :
                     null;
 
-                // StartsWith
-                if (method == "StartsWith")
+            if (type == typeof(Enumerable))
+            {
+                if (paramType == ExpressionType.Parameter)
                 {
-                    var value = this.VisitValue(met.Arguments[0], null);
+                    var field = this.GetField(expr.Arguments[0]);
+                    var lambda = expr.Arguments[1] as LambdaExpression;
 
-                    return Query.StartsWith(this.GetField(met.Object, prefix), value);
+                    _fieldPrefixes.Push(field);
+                    var query = this.Visit(lambda.Body);
+                    _fieldPrefixes.Pop();
+                    return query;
                 }
-                // Equals
-                else if (method == "Equals")
+                else
                 {
-                    var value = this.VisitValue(met.Arguments[0], null);
-
-                    return Query.EQ(this.GetField(met.Object, prefix), value);
-                }
-                // Contains (String): x.Name.Contains("auricio")
-                else if (method == "Contains" && type == typeof(string))
-                {
-                    var value = this.VisitValue(met.Arguments[0], null);
-
-                    return Query.Contains(this.GetField(met.Object, prefix), value);
-                }
-                // Contains (Enumerable): x.ListNumber.Contains(2)
-                else if (method == "Contains" && type == typeof(Enumerable))
-                {
-                    var field = this.GetField(met.Arguments[0], prefix);
-                    var value = this.VisitValue(met.Arguments[1], null);
-
-                    return Query.EQ(field, value);
-                }
-                // Any (Enumerable): x.Customer.Any(z => z.Name.StartsWith("John"))
-                else if(method == "Any" && type == typeof(Enumerable) && paramType == ExpressionType.Parameter)
-                {
-                    var field = this.GetField(met.Arguments[0]);
-                    var lambda = met.Arguments[1] as LambdaExpression;
-
-                    return this.VisitExpression(lambda.Body, field + ".");
-                }
-                // System.Linq.Enumerable methods (constant list items)
-                else if (type == typeof(Enumerable))
-                {
-                    return ParseEnumerableExpression(met);
+                    return EnumerableMethodCallExpression(expr);
                 }
             }
 
-            throw new NotImplementedException("Not implemented Linq expression");
+
+            throw new Exception();
         }
 
-        private BsonValue VisitValue(Expression expr, Expression left)
+        private Query EnumerableMethodCallExpression(MethodCallExpression expr)
+        {
+            if (expr.Method.DeclaringType != typeof(Enumerable))
+                throw new NotImplementedException("Cannot parse methods outside the System.Linq.Enumerable class.");
+
+            var values = this.GetValue(expr.Arguments[0]).AsArray;
+            var lambda = expr.Arguments[1] as LambdaExpression;
+            var queries = new Query[values.Count];
+
+            for (var i = 0; i < queries.Length; i++)
+            {
+                _parameters[lambda.Parameters[0]] = values[i];
+                queries[i] = Visit(lambda.Body);
+            }
+
+            _parameters.Remove(lambda.Parameters[0]);
+
+            if (expr.Method.Name == "Any")
+            {
+                return CreateOrQuery(ref queries);
+            }
+            else if (expr.Method.Name == "All")
+            {
+                return CreateAndQuery(ref queries);
+            }
+
+            throw new NotImplementedException("Not implemented System.Linq.Enumerable method");
+        }
+
+        public Query Visit(MemberExpression expr)
+        {
+            if (expr.Type == typeof(bool))
+            {
+                return Query.EQ(this.GetField(expr), new BsonValue(true));
+            }
+
+            throw new Exception();
+        }
+
+        public Query Visit(ConstantExpression expr)
+        {
+            if (typeof(IQueryable).IsAssignableFrom(expr.Type))
+                return Query.All();
+
+            if (typeof(bool).IsAssignableFrom(expr.Type))
+                return (bool)expr.Value ? Query.All() : new QueryEmpty();
+
+            throw new Exception();
+        }
+
+        public Query Visit(UnaryExpression expr)
+        {
+            if (expr.NodeType == ExpressionType.Not)
+            {
+                var query = Visit(expr.Operand);
+                return Query.Not(query);
+            }
+
+            throw new Exception();
+        }
+
+        public Query Visit(LambdaExpression expr)
+        {
+            return Visit(expr.Body);
+        }
+
+        public Query Visit(BinaryExpression expr)
+        {
+            switch (expr.NodeType)
+            {
+                case ExpressionType.GreaterThanOrEqual:
+                    return Query.GTE(GetField(expr.Left), GetValue(expr.Right, expr.Left));
+
+                case ExpressionType.GreaterThan:
+                    return Query.GT(GetField(expr.Left), GetValue(expr.Right, expr.Left));
+
+                case ExpressionType.LessThan:
+                    return Query.LT(GetField(expr.Left), GetValue(expr.Right, expr.Left));
+
+                case ExpressionType.LessThanOrEqual:
+                    return Query.LTE(GetField(expr.Left), GetValue(expr.Right, expr.Left));
+
+                case ExpressionType.Equal:
+                    return Query.EQ(GetField(expr.Left), GetValue(expr.Right, expr.Left));
+
+                case ExpressionType.NotEqual:
+                    return Query.Not(GetField(expr.Left), GetValue(expr.Right, expr.Left));
+
+                case ExpressionType.AndAlso:
+                    var andLeft = Visit(expr.Left);
+                    var andRight = Visit(expr.Right);
+                    return Query.And(andLeft, andRight);
+
+                case ExpressionType.OrElse:
+                    var orLeft = Visit(expr.Left);
+                    var orRight = Visit(expr.Right);
+                    return Query.Or(orLeft, orRight);
+            }
+
+            throw new Exception();
+        }
+
+        public Query Visit(InvocationExpression expr)
+        {
+            var lambda = expr.Expression as LambdaExpression;
+            return this.Visit(lambda.Body);
+        }
+
+        public string GetField(Expression expr)
+        {
+            var prefix = BuildPrefix();
+            var property = prefix + expr.GetPath();
+            var parts = property.Split('.');
+            var fields = new string[parts.Length];
+            var type = _type;
+            var isdbref = false;
+
+            // loop "first.second.last"
+            for (var i = 0; i < parts.Length; i++)
+            {
+                var entity = _mapper.GetEntityMapper(type);
+                var part = parts[i];
+                var prop = entity.Members.Find(x => x.MemberName == part);
+
+                if (prop == null) throw LiteException.PropertyNotMapped(property);
+
+                // if property is an IEnumerable, gets underlying type (otherwise, gets PropertyType)
+                type = prop.UnderlyingType;
+
+                fields[i] = prop.FieldName;
+
+                if (prop.FieldName == "_id" && isdbref)
+                {
+                    isdbref = false;
+                    fields[i] = "$id";
+                }
+
+                // if this property is DbRef, so if next property is _id, change to $id
+                if (prop.IsDbRef) isdbref = true;
+            }
+
+            return string.Join(".", fields);
+        }
+
+        private string BuildPrefix()
+        {
+            var prefix = string.Empty;
+            if (_fieldPrefixes.Any())
+                prefix = string.Join(".", _fieldPrefixes.ToArray()) + ".";
+
+            return prefix;
+        }
+
+        private BsonValue GetValue(Expression expr, Expression left = null)
         {
             // check if left side is an enum and convert to string before return
             Func<Type, object, BsonValue> convert = (type, value) =>
@@ -203,7 +350,7 @@ namespace LiteDB
             else if (expr is MemberExpression && _parameters.Count > 0)
             {
                 var mExpr = (MemberExpression)expr;
-                var mValue = this.VisitValue(mExpr.Expression, left);
+                var mValue = this.GetValue(mExpr.Expression, left);
                 var value = mValue.AsDocument[mExpr.Member.Name];
 
                 return convert(typeof(object), value);
@@ -257,73 +404,7 @@ namespace LiteDB
             }
         }
 
-        private Query ParseEnumerableExpression(MethodCallExpression expr)
-        {
-            if (expr.Method.DeclaringType != typeof(Enumerable))
-                throw new NotImplementedException("Cannot parse methods outside the System.Linq.Enumerable class.");
 
-            var lambda = (LambdaExpression)expr.Arguments[1];
-            var values = this.VisitValue(expr.Arguments[0], null).AsArray;
-            var queries = new Query[values.Count];
-
-            for (var i = 0; i < queries.Length; i++)
-            {
-                _parameters[lambda.Parameters[0]] = values[i];
-                queries[i] = this.VisitExpression(lambda.Body);
-            }
-
-            _parameters.Remove(lambda.Parameters[0]);
-
-            if (expr.Method.Name == "Any")
-            {
-                return CreateOrQuery(ref queries);
-            }
-            else if (expr.Method.Name == "All")
-            {
-                return CreateAndQuery(ref queries);
-            }
-
-            throw new NotImplementedException("Not implemented System.Linq.Enumerable method");
-        }
-
-        /// <summary>
-        /// Based on an expression, returns document field mapped from class Property.
-        /// Support multi level dotted notation: x => x.Customer.Name
-        /// Prefix is used on array expression like: x => x.Customers.Any(z => z.Name == "John") (prefix = "Customers." 
-        /// </summary>
-        public string GetField(Expression expr, string prefix = "")
-        {
-            var property = prefix + expr.GetPath();
-            var parts = property.Split('.');
-            var fields = new string[parts.Length];
-            var type = _type;
-            var isdbref = false;
-
-            // loop "first.second.last"
-            for (var i = 0; i < parts.Length; i++)
-            {
-                var entity = _mapper.GetEntityMapper(type);
-                var part = parts[i];
-                var prop = entity.Members.Find(x => x.MemberName == part);
-
-                if (prop == null) throw LiteException.PropertyNotMapped(property);
-
-                // if property is an IEnumerable, gets underlying type (otherwise, gets PropertyType)
-                type = prop.UnderlyingType;
-
-                fields[i] = prop.FieldName;
-
-                if (prop.FieldName == "_id" && isdbref)
-                {
-                    isdbref = false;
-                    fields[i] = "$id";
-                }
-
-                // if this property is DbRef, so if next property is _id, change to $id
-                if (prop.IsDbRef) isdbref = true;
-            }
-
-            return string.Join(".", fields);
-        }
     }
+    
 }
