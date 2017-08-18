@@ -84,6 +84,9 @@ namespace LiteDB
                 case "Any":
                     return AnyMethodCallExpression(expr);
 
+                case "All":
+                    return AllMethodCallExpression(expr);
+
                 default:
                     return EnumerableMethodCallExpression(expr);
             }
@@ -125,16 +128,28 @@ namespace LiteDB
                 return Query.Contains(field, value);
             }
 
-            // Contains (Enumerable): x.ListNumber.Contains(2)
             if (type == typeof(Enumerable))
             {
-                var field = this.GetField(expr.Arguments[0]);
-                var value = this.GetValue(expr.Arguments[1]);
+                var paramType = GetArgument0Type(expr);
 
-                return Query.EQ(field, value);
+                if (paramType == ExpressionType.Parameter)
+                {
+                    // Contains (Enumerable): x.ListNumber.Contains(2)
+                    var field = this.GetField(expr.Arguments[0]);
+                    var value = this.GetValue(expr.Arguments[1]);
+                    return Query.EQ(field, value);
+                }
+                else
+                {
+                    // Contains (enumerable) searchValues.Contains(x.Id)
+                    var containsValues = this.GetValue(expr.Arguments[0]).AsArray;
+                    var field = this.GetField(expr.Arguments[1]);
+                    return Query.In(field, containsValues);
+                }
             }
 
             throw new Exception();
+            //return EnumerableMethodCallExpression(expr);
         }
 
         private Query AnyMethodCallExpression(MethodCallExpression expr)
@@ -145,9 +160,7 @@ namespace LiteDB
             var type = expr.Method.DeclaringType;
 #endif
 
-            var paramType = expr.Arguments[0] is MemberExpression ?
-                    (ExpressionType?)(expr.Arguments[0] as MemberExpression).Expression.NodeType :
-                    null;
+            var paramType = GetArgument0Type(expr);
 
             if (type == typeof(Enumerable))
             {
@@ -169,6 +182,11 @@ namespace LiteDB
 
 
             throw new Exception();
+        }
+
+        private Query AllMethodCallExpression(MethodCallExpression expr)
+        {
+            throw new NotImplementedException();
         }
 
         private Query EnumerableMethodCallExpression(MethodCallExpression expr)
@@ -363,6 +381,12 @@ namespace LiteDB
                     return result;
                 }
             }
+            else if (expr is NewArrayExpression)
+            {
+                var values = (expr as NewArrayExpression).Expressions.Select(e => GetValue(e));
+                return new BsonArray(values);
+            }
+
 
             // execute expression
             var objectMember = Expression.Convert(expr, typeof(object));
@@ -404,7 +428,15 @@ namespace LiteDB
             }
         }
 
+        private ExpressionType GetArgument0Type(MethodCallExpression expr)
+        {
+            if (expr.Arguments[0] is MemberExpression)
+                return (expr.Arguments[0] as MemberExpression).Expression.NodeType;
+
+            return expr.Arguments[0].NodeType;
+
+        }
 
     }
-    
+
 }
